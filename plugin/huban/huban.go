@@ -44,7 +44,7 @@ var (
 	// 允许的请求来源列表 - 参考panyq插件实现
 	// 支持前缀匹配，例如 "https://example.com" 会匹配 "https://example.com/path"
 	AllowedReferers = []string{
-		"https://dm.xueximeng.com",
+		// "https://dm.xueximeng.com",
 		"http://localhost:8888",
 		// 可以根据需要添加更多允许的来源
 	}
