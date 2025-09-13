@@ -1,4 +1,4 @@
-package pan666
+package bixin
 
 import (
 	"fmt"
@@ -19,12 +19,12 @@ import (
 // 在init函数中注册插件
 func init() {
 	// 注册插件
-	plugin.RegisterGlobalPlugin(NewPan666AsyncPlugin())
+	plugin.RegisterGlobalPlugin(NewBixinAsyncPlugin())
 }
 
 const (
 	// API基础URL
-	BaseURL = "https://pan666.net/api/discussions"
+	BaseURL = "https://www.bixbiy.com/api/discussions"
 	
 	// 默认参数
 	PageSize = 50 // 符合API实际返回数量
@@ -41,22 +41,22 @@ var userAgents = []string{
 	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
 }
 
-// Pan666AsyncPlugin pan666网盘搜索异步插件
-type Pan666AsyncPlugin struct {
+// BixinAsyncPlugin bixin网盘搜索异步插件
+type BixinAsyncPlugin struct {
 	*plugin.BaseAsyncPlugin
 	retries int
 }
 
-// NewPan666AsyncPlugin 创建新的pan666异步插件
-func NewPan666AsyncPlugin() *Pan666AsyncPlugin {
-	return &Pan666AsyncPlugin{
-		BaseAsyncPlugin: plugin.NewBaseAsyncPlugin("pan666", 3),
+// NewBixinAsyncPlugin 创建新的bixin异步插件
+func NewBixinAsyncPlugin() *BixinAsyncPlugin {
+	return &BixinAsyncPlugin{
+		BaseAsyncPlugin: plugin.NewBaseAsyncPluginWithFilter("bixin", 3, true), // 跳过Service层过滤
 		retries:         MaxRetries,
 	}
 }
 
 // Search 执行搜索并返回结果（兼容性方法）
-func (p *Pan666AsyncPlugin) Search(keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
+func (p *BixinAsyncPlugin) Search(keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
 	result, err := p.SearchWithResult(keyword, ext)
 	if err != nil {
 		return nil, err
@@ -65,12 +65,12 @@ func (p *Pan666AsyncPlugin) Search(keyword string, ext map[string]interface{}) (
 }
 
 // SearchWithResult 执行搜索并返回包含IsFinal标记的结果
-func (p *Pan666AsyncPlugin) SearchWithResult(keyword string, ext map[string]interface{}) (model.PluginSearchResult, error) {
+func (p *BixinAsyncPlugin) SearchWithResult(keyword string, ext map[string]interface{}) (model.PluginSearchResult, error) {
 	return p.AsyncSearchWithResult(keyword, p.doSearch, p.MainCacheKey, ext)
 }
 
 // doSearch 实际的搜索实现
-func (p *Pan666AsyncPlugin) doSearch(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
+func (p *BixinAsyncPlugin) doSearch(client *http.Client, keyword string, ext map[string]interface{}) ([]model.SearchResult, error) {
 	// 初始化随机数种子
 	rand.Seed(time.Now().UnixNano())
 	
@@ -90,7 +90,7 @@ func (p *Pan666AsyncPlugin) doSearch(client *http.Client, keyword string, ext ma
 }
 
 // fetchBatch 获取一批页面的数据
-func (p *Pan666AsyncPlugin) fetchBatch(client *http.Client, keyword string, startOffset, pageCount int) ([]model.SearchResult, bool, error) {
+func (p *BixinAsyncPlugin) fetchBatch(client *http.Client, keyword string, startOffset, pageCount int) ([]model.SearchResult, bool, error) {
 	var wg sync.WaitGroup
 	resultChan := make(chan struct{
 		offset  int
@@ -154,7 +154,7 @@ func (p *Pan666AsyncPlugin) fetchBatch(client *http.Client, keyword string, star
 }
 
 // deduplicateResults 去除重复结果
-func (p *Pan666AsyncPlugin) deduplicateResults(results []model.SearchResult) []model.SearchResult {
+func (p *BixinAsyncPlugin) deduplicateResults(results []model.SearchResult) []model.SearchResult {
 	seen := make(map[string]bool)
 	unique := make([]model.SearchResult, 0, len(results))
 	
@@ -174,7 +174,7 @@ func (p *Pan666AsyncPlugin) deduplicateResults(results []model.SearchResult) []m
 }
 
 // fetchPage 获取指定页的搜索结果
-func (p *Pan666AsyncPlugin) fetchPage(client *http.Client, keyword string, offset int) ([]model.SearchResult, bool, error) {
+func (p *BixinAsyncPlugin) fetchPage(client *http.Client, keyword string, offset int) ([]model.SearchResult, bool, error) {
 	// 构建API URL
 	apiURL := fmt.Sprintf("%s?filter[q]=%s&include=mostRelevantPost&page[offset]=%d&page[limit]=%d",
 		BaseURL, url.QueryEscape(keyword), offset, PageSize)
@@ -236,14 +236,14 @@ func (p *Pan666AsyncPlugin) fetchPage(client *http.Client, keyword string, offse
 	}
 	
 	// 解析响应
-	var apiResp Pan666Response
+	var apiResp BixinResponse
 	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
 		return nil, false, fmt.Errorf("解析响应失败: %w", err)
 	}
 	
 	// 处理结果
 	results := make([]model.SearchResult, 0, len(apiResp.Data))
-	postMap := make(map[string]Pan666Post)
+	postMap := make(map[string]BixinPost)
 	
 	// 创建帖子ID到帖子内容的映射
 	for _, post := range apiResp.Included {
@@ -262,11 +262,8 @@ func (p *Pan666AsyncPlugin) fetchPage(client *http.Client, keyword string, offse
 		// 清理HTML内容
 		cleanedHTML := cleanHTML(post.Attributes.ContentHTML)
 		
-		// 提取链接
-		links := extractLinksFromText(cleanedHTML)
-		if len(links) == 0 {
-			links = extractLinks(cleanedHTML)
-		}
+		// 提取链接（只处理移动云盘）
+		links := extractMobileLinksFromText(cleanedHTML)
 		
 		// 如果没有找到链接，跳过该结果
 		if len(links) == 0 {
@@ -280,14 +277,16 @@ func (p *Pan666AsyncPlugin) fetchPage(client *http.Client, keyword string, offse
 		}
 		
 		// 创建唯一ID：插件名-帖子ID
-		uniqueID := fmt.Sprintf("pan666-%s", discussion.ID)
+		uniqueID := fmt.Sprintf("bixin-%s", discussion.ID)
 		
 		// 创建搜索结果
 		result := model.SearchResult{
 			UniqueID:  uniqueID,
 			Title:     discussion.Attributes.Title,
+			Content:   cleanedHTML, // 使用清理后的HTML作为内容
 			Datetime:  createdTime,
 			Links:     links,
+			Channel:   "", // 插件搜索结果Channel为空
 		}
 		
 		results = append(results, result)
@@ -313,99 +312,7 @@ func getRandomUA() string {
 	return userAgents[rand.Intn(len(userAgents))]
 }
 
-// 从文本提取链接
-func extractLinks(content string) []model.Link {
-	var allLinks []model.Link
-	
-	// 提取百度网盘链接
-	baiduLinks := extractLinksByPattern(content, "链接: https://pan.baidu.com", "提取码:", "baidu")
-	allLinks = append(allLinks, baiduLinks...)
-	
-	// 提取阿里云盘链接
-	aliyunLinks := extractLinksByPattern(content, "https://www.aliyundrive.com/s/", "提取码:", "aliyun")
-	allLinks = append(allLinks, aliyunLinks...)
-	
-	// 提取天翼云盘链接
-	tianyiLinks := extractLinksByPattern(content, "https://cloud.189.cn", "访问码:", "tianyi")
-	allLinks = append(allLinks, tianyiLinks...)
-	
-	return allLinks
-}
-
-// 根据模式提取链接
-func extractLinksByPattern(content, pattern, altPattern, linkType string) []model.Link {
-	var links []model.Link
-	
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		if strings.Contains(line, pattern) {
-			link := extractLinkFromLine(line, pattern)
-			
-			// 如果在当前行找不到密码，尝试在下一行查找
-			if link.Password == "" && i+1 < len(lines) && strings.Contains(lines[i+1], altPattern) {
-				passwordLine := lines[i+1]
-				start := strings.Index(passwordLine, altPattern) + len(altPattern)
-				if start < len(passwordLine) {
-					end := len(passwordLine)
-					// 提取密码（移除前后空格）
-					password := strings.TrimSpace(passwordLine[start:end])
-					link.Password = password
-				}
-			}
-			
-			link.Type = linkType
-			links = append(links, link)
-		}
-	}
-	
-	return links
-}
-
-// 从行中提取链接
-func extractLinkFromLine(line, prefix string) model.Link {
-	var link model.Link
-	
-	start := strings.Index(line, prefix)
-	if start < 0 {
-		return link
-	}
-	
-	// 查找URL的结束位置
-	end := len(line)
-	possibleEnds := []string{" ", "提取码", "密码", "访问码"}
-	for _, endStr := range possibleEnds {
-		pos := strings.Index(line[start:], endStr)
-		if pos > 0 && start+pos < end {
-			end = start + pos
-		}
-	}
-	
-	// 提取URL
-	url := strings.TrimSpace(line[start:end])
-	link.URL = url
-	
-	// 尝试从同一行提取密码
-	passwordKeywords := []string{"提取码:", "密码:", "访问码:"}
-	for _, keyword := range passwordKeywords {
-		passwordStart := strings.Index(line, keyword)
-		if passwordStart >= 0 {
-			passwordStart += len(keyword)
-			passwordEnd := len(line)
-			password := strings.TrimSpace(line[passwordStart:passwordEnd])
-			link.Password = password
-			break
-		}
-	}
-	
-	// 尝试从URL中提取密码
-	if link.Password == "" {
-		link.Password = extractPasswordFromURL(url)
-	}
-	
-	return link
-}
-
-// 清理HTML内容
+// 清理HTML内容（参考pan666的cleanHTML函数）
 func cleanHTML(html string) string {
 	// 移除<br>标签
 	html = strings.ReplaceAll(html, "<br>", "\n")
@@ -454,8 +361,8 @@ func cleanHTML(html string) string {
 	return strings.Join(cleanedLines, "\n")
 }
 
-// 提取文本中的链接
-func extractLinksFromText(content string) []model.Link {
+// 从文本提取移动云盘链接（bixin专用）
+func extractMobileLinksFromText(content string) []model.Link {
 	var allLinks []model.Link
 	
 	lines := strings.Split(content, "\n")
@@ -476,11 +383,10 @@ func extractLinksFromText(content string) []model.Link {
 	
 	// 第一遍：查找所有的链接和密码
 	for i, line := range lines {
-		// 检查链接
 		line = strings.TrimSpace(line)
 		
-		// 检查百度网盘
-		if strings.Contains(line, "pan.baidu.com") {
+		// 只检查移动云盘（bixin只支持移动云盘）
+		if strings.Contains(line, "caiyun.139.com") {
 			url := extractURLFromText(line)
 			if url != "" {
 				linkInfos = append(linkInfos, struct {
@@ -488,48 +394,15 @@ func extractLinksFromText(content string) []model.Link {
 					position int
 					category string
 				}{
-					link:     model.Link{URL: url, Type: "baidu"},
+					link:     model.Link{URL: url, Type: "mobile"},
 					position: i,
-					category: "baidu",
+					category: "mobile",
 				})
 			}
 		}
 		
-		// 检查阿里云盘
-		if strings.Contains(line, "aliyundrive.com") {
-			url := extractURLFromText(line)
-			if url != "" {
-				linkInfos = append(linkInfos, struct {
-					link     model.Link
-					position int
-					category string
-				}{
-					link:     model.Link{URL: url, Type: "aliyun"},
-					position: i,
-					category: "aliyun",
-				})
-			}
-		}
-		
-		
-		// 检查天翼云盘
-		if strings.Contains(line, "cloud.189.cn") {
-			url := extractURLFromText(line)
-			if url != "" {
-				linkInfos = append(linkInfos, struct {
-					link     model.Link
-					position int
-					category string
-				}{
-					link:     model.Link{URL: url, Type: "tianyi"},
-					position: i,
-					category: "tianyi",
-				})
-			}
-		}
-		
-		// 检查提取码/密码/访问码
-		passwordKeywords := []string{"提取码", "密码", "访问码"}
+		// 检查密码/访问码（移动云盘主要使用访问码）
+		passwordKeywords := []string{"访问码", "密码"}
 		for _, keyword := range passwordKeywords {
 			if strings.Contains(line, keyword) {
 				// 寻找冒号后面的内容
@@ -571,14 +444,10 @@ func extractLinksFromText(content string) []model.Link {
 		var closestPassword string
 		
 		for _, pwInfo := range passwordInfos {
-			// 根据链接类型和密码关键词进行匹配
+			// 移动云盘匹配访问码或密码
 			match := false
 			
-			if linkInfos[i].category == "baidu" && (pwInfo.keyword == "提取码" || pwInfo.keyword == "密码") {
-				match = true
-			} else if linkInfos[i].category == "aliyun" && (pwInfo.keyword == "提取码" || pwInfo.keyword == "密码") {
-				match = true
-			} else if linkInfos[i].category == "tianyi" && (pwInfo.keyword == "访问码" || pwInfo.keyword == "密码") {
+			if linkInfos[i].category == "mobile" && (pwInfo.keyword == "访问码" || pwInfo.keyword == "密码") {
 				match = true
 			}
 			
@@ -673,18 +542,18 @@ func abs(n int) int {
 	return n
 }
 
-// Pan666Response API响应结构
-type Pan666Response struct {
+// BixinResponse API响应结构
+type BixinResponse struct {
 	Links struct {
 		First string `json:"first"`
 		Next  string `json:"next,omitempty"`
 	} `json:"links"`
-	Data     []Pan666Discussion `json:"data"`
-	Included []Pan666Post       `json:"included"`
+	Data     []BixinDiscussion `json:"data"`
+	Included []BixinPost       `json:"included"`
 }
 
-// Pan666Discussion 讨论信息
-type Pan666Discussion struct {
+// BixinDiscussion 讨论信息
+type BixinDiscussion struct {
 	Type       string `json:"type"`
 	ID         string `json:"id"`
 	Attributes struct {
@@ -706,8 +575,8 @@ type Pan666Discussion struct {
 	} `json:"relationships"`
 }
 
-// Pan666Post 帖子内容
-type Pan666Post struct {
+// BixinPost 帖子内容
+type BixinPost struct {
 	Type       string `json:"type"`
 	ID         string `json:"id"`
 	Attributes struct {
@@ -716,4 +585,4 @@ type Pan666Post struct {
 		ContentType string `json:"contentType"`
 		ContentHTML string `json:"contentHtml"`
 	} `json:"attributes"`
-} 
+}

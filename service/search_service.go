@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"pansou/config"
@@ -15,9 +18,18 @@ import (
 	"pansou/util"
 	"pansou/util/cache"
 	"pansou/util/pool"
-	"sync"
-	"regexp"
 )
+
+// normalizeUrl 标准化URL，将URL编码的中文部分解码为中文，用于去重
+func normalizeUrl(rawUrl string) string {
+	// 解码URL中的编码字符
+	decoded, err := url.QueryUnescape(rawUrl)
+	if err != nil {
+		// 如果解码失败，返回原始URL
+		return rawUrl
+	}
+	return decoded
+}
 
 // 全局缓存写入管理器引用（避免循环依赖）
 var globalCacheWriteManager *cache.DelayedBatchWriteManager
@@ -224,7 +236,7 @@ func injectMainCacheToAsyncPlugins(pluginManager *plugin.PluginManager, mainCach
 		return
 	}
 	
-	// 🔧 设置全局序列化器，确保异步插件与主程序使用相同的序列化格式
+	// 设置全局序列化器，确保异步插件与主程序使用相同的序列化格式
 	serializer := mainCache.GetSerializer()
 	if serializer != nil {
 		plugin.SetGlobalCacheSerializer(serializer)
@@ -232,12 +244,12 @@ func injectMainCacheToAsyncPlugins(pluginManager *plugin.PluginManager, mainCach
 	
 	// 创建缓存更新函数（支持IsFinal参数）- 接收原始数据并与现有缓存合并
 	cacheUpdater := func(key string, newResults []model.SearchResult, ttl time.Duration, isFinal bool, keyword string, pluginName string) error {
-		// 🚀 优化：如果新结果为空，跳过缓存更新（避免无效操作）
+		// 优化：如果新结果为空，跳过缓存更新（避免无效操作）
 		if len(newResults) == 0 {
 			return nil
 		}
 		
-		// 🔧 获取现有缓存数据进行合并
+		// 获取现有缓存数据进行合并
 		var finalResults []model.SearchResult
 		if existingData, hit, err := mainCache.Get(key); err == nil && hit {
 			var existingResults []model.SearchResult
@@ -256,9 +268,9 @@ func injectMainCacheToAsyncPlugins(pluginManager *plugin.PluginManager, mainCach
 							if config.AppConfig != nil && config.AppConfig.AsyncLogEnabled {
 				displayKey := key[:8] + "..."
 				if keyword != "" {
-					fmt.Printf("⚠️ [异步插件 %s] 缓存反序列化失败，使用新结果: %s(关键词:%s) | 结果数: %d\n", pluginName, displayKey, keyword, len(newResults))
+					fmt.Printf("[异步插件 %s] 缓存反序列化失败，使用新结果: %s(关键词:%s) | 结果数: %d\n", pluginName, displayKey, keyword, len(newResults))
 				} else {
-					fmt.Printf("⚠️ [异步插件 %s] 缓存反序列化失败，使用新结果: %s | 结果数: %d\n", pluginName, key, len(newResults))
+					fmt.Printf("[异步插件 %s] 缓存反序列化失败，使用新结果: %s | 结果数: %d\n", pluginName, key, len(newResults))
 				}
 			}
 			}
@@ -275,17 +287,12 @@ func injectMainCacheToAsyncPlugins(pluginManager *plugin.PluginManager, mainCach
 		}
 		}
 		
-		// 🔧 序列化合并后的结果
+		// 序列化合并后的结果
 		data, err := mainCache.GetSerializer().Serialize(finalResults)
 		if err != nil {
-			fmt.Printf("❌ [缓存更新] 序列化失败: %s | 错误: %v\n", key, err)
+			fmt.Printf("[缓存更新] 序列化失败: %s | 错误: %v\n", key, err)
 			return err
 		}
-		
-		// 🔥 使用新的缓存写入管理器
-		// 注意：获取外部引用需要导入main包
-		// 为了避免循环依赖，我们暂时通过全局变量访问
-		// TODO: 优化架构，使用依赖注入方式
 		
 		// 先更新内存缓存（立即可见）
 		if err := mainCache.SetMemoryOnly(key, data, ttl); err != nil {
@@ -745,11 +752,60 @@ func extractLinkTitlePairsWithoutNewlines(content string) map[string]string {
 	// 结果映射：链接URL -> 对应标题
 	linkTitleMap := make(map[string]string)
 	
-	// 链接正则表达式 - 精确匹配夸克网盘链接
-	linkRegex := regexp.MustCompile(`https?://pan\.quark\.cn/s/[a-zA-Z0-9]+`)
+	// 使用精确的网盘链接正则表达式集合，避免贪婪匹配
+	linkPatterns := []*regexp.Regexp{
+		util.TianyiPanPattern,  // 天翼云盘
+		util.BaiduPanPattern,   // 百度网盘
+		util.QuarkPanPattern,   // 夸克网盘
+		util.AliyunPanPattern,  // 阿里云盘
+		util.UCPanPattern,      // UC网盘
+		util.Pan123Pattern,     // 123网盘
+		util.Pan115Pattern,     // 115网盘
+		util.XunleiPanPattern,  // 迅雷网盘
+	}
 	
-	// 提取所有链接
-	links := linkRegex.FindAllString(content, -1)
+	// 收集所有链接及其位置
+	type linkInfo struct {
+		url string
+		pos int
+	}
+	var allLinks []linkInfo
+	
+	// 使用各个精确正则表达式查找链接
+	for _, pattern := range linkPatterns {
+		matches := pattern.FindAllString(content, -1)
+		for _, match := range matches {
+			pos := strings.Index(content, match)
+			if pos >= 0 {
+				allLinks = append(allLinks, linkInfo{url: match, pos: pos})
+			}
+		}
+	}
+	
+	// 按位置排序
+	for i := 0; i < len(allLinks)-1; i++ {
+		for j := i + 1; j < len(allLinks); j++ {
+			if allLinks[i].pos > allLinks[j].pos {
+				allLinks[i], allLinks[j] = allLinks[j], allLinks[i]
+			}
+		}
+	}
+	
+	// URL标准化和去重
+	uniqueLinks := make(map[string]string) // 标准化URL -> 原始URL
+	var links []string
+	
+	for _, linkInfo := range allLinks {
+		// 标准化URL（将URL编码转换为中文）
+		normalized := normalizeUrl(linkInfo.url)
+		
+		// 如果这个标准化URL还没有见过，则保留
+		if _, exists := uniqueLinks[normalized]; !exists {
+			uniqueLinks[normalized] = linkInfo.url
+			links = append(links, linkInfo.url)
+		}
+	}
+	
 	if len(links) == 0 {
 		return linkTitleMap
 	}
@@ -881,7 +937,7 @@ func isEmpty(line string) bool {
 // 将搜索结果按网盘类型分组
 func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes []string) model.MergedLinks {
 	// 创建合并结果的映射
-	mergedLinks := make(model.MergedLinks, 10) // 预分配容量，假设有10种不同的网盘类型
+	mergedLinks := make(model.MergedLinks, 12) // 预分配容量，假设有12种不同的网盘类型
 
 	// 用于去重的映射，键为URL
 	uniqueLinks := make(map[string]model.MergedLink)
@@ -899,8 +955,20 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 			// 这是没有换行符的情况，尝试直接匹配
 			content := result.Content
 			
-			// 尝试使用"链接："分割内容
-			parts := strings.Split(content, "链接：")
+			// 支持多种网盘链接前缀
+			linkPrefixes := []string{"天翼链接：", "百度链接：", "夸克链接：", "阿里链接：", "UC链接：", "115链接：", "迅雷链接：", "123链接：", "链接："}
+			
+			var parts []string
+			
+			// 尝试找到匹配的前缀
+			for _, prefix := range linkPrefixes {
+				if strings.Contains(content, prefix) {
+					parts = strings.Split(content, prefix)
+					break
+				}
+			}
+			
+			// 如果找到了匹配的前缀并且分割成功
 			if len(parts) > 1 && len(result.Links) <= len(parts)-1 {
 				// 第一部分是第一个标题
 				titles := make([]string, 0, len(parts))
@@ -909,10 +977,12 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 				// 处理每个包含链接的部分，提取标题
 				for i := 1; i < len(parts)-1; i++ {
 					part := parts[i]
-					// 找到链接的结束位置
+					// 找到链接的结束位置，使用更通用的分隔符
 					linkEnd := -1
 					for j, c := range part {
-						if c == ' ' || c == '窃' || c == '东' || c == '迎' || c == '千' || c == '我' || c == '恋' || c == '将' || c == '野' {
+						// 扩展分隔符列表，包含更多可能的字符
+						if c == ' ' || c == '窃' || c == '东' || c == '迎' || c == '千' || c == '我' || c == '恋' || c == '将' || c == '野' || 
+						   c == '合' || c == '集' || c == '天' || c == '翼' || c == '网' || c == '盘' || c == '(' || c == '（' {
 							linkEnd = j
 							break
 						}
@@ -964,9 +1034,12 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 				}
 			}
 			
-			// 如果关键词不为空，且标题不包含关键词，且不是跳过过滤的插件，则跳过此链接
-			if !skipKeywordFilter && keyword != "" && !strings.Contains(strings.ToLower(title), lowerKeyword) {
-				continue
+			// 关键词过滤：现在我们有了准确的链接-标题对应关系，只需检查每个链接的具体标题
+			if !skipKeywordFilter && keyword != "" {
+				// 只检查链接的具体标题，无论是TG来源还是插件来源
+				if !strings.Contains(strings.ToLower(title), lowerKeyword) {
+					continue
+				}
 			}
 			
 			// 确定数据来源
@@ -1045,17 +1118,6 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 		mergedLinks[linkType] = append(mergedLinks[linkType], mergedLink)
 	}
 
-	// 注意：不再重新排序，保持SearchResult阶段的权重排序结果
-	// 原来的时间排序会覆盖权重排序，现在注释掉
-	/*
-	// 对每种类型的链接按时间排序（新的在前面）
-	for linkType, links := range mergedLinks {
-		sort.Slice(links, func(i, j int) bool {
-			return links[i].Datetime.After(links[j].Datetime)
-		})
-		mergedLinks[linkType] = links
-	}
-	*/
 
 	// 如果指定了cloudTypes，则过滤结果
 	if len(cloudTypes) > 0 {
@@ -1185,7 +1247,7 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 					return results, nil
 				} else {
 					displayKey := cacheKey[:8] + "..."
-					fmt.Printf("❌ [主服务] 缓存反序列化失败: %s(关键词:%s) | 错误: %v\n", displayKey, keyword, err)
+					fmt.Printf("[主服务] 缓存反序列化失败: %s(关键词:%s) | 错误: %v\n", displayKey, keyword, err)
 				}
 			}
 		}
@@ -1276,7 +1338,7 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 		}
 	}
 	
-	// 🔧 恢复主程序缓存更新：确保最终合并结果被正确缓存
+	// 恢复主程序缓存更新：确保最终合并结果被正确缓存
 	if cacheInitialized && config.AppConfig.CacheEnabled {
 		go func(res []model.SearchResult, kw string, key string) {
 			ttl := time.Duration(config.AppConfig.CacheTTLMinutes) * time.Minute
@@ -1285,12 +1347,12 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 			if enhancedTwoLevelCache != nil {
 				data, err := enhancedTwoLevelCache.GetSerializer().Serialize(res)
 				if err != nil {
-					fmt.Printf("❌ [主程序] 缓存序列化失败: %s | 错误: %v\n", key, err)
+					fmt.Printf("[主程序] 缓存序列化失败: %s | 错误: %v\n", key, err)
 					return
 				}
 				
-							// 主程序最后更新，覆盖可能有问题的异步插件缓存
-			// 🔥 修复：使用同步方式确保数据写入磁盘
+			// 主程序最后更新，覆盖可能有问题的异步插件缓存
+			// 使用同步方式确保数据写入磁盘
 			enhancedTwoLevelCache.SetBothLevels(key, data, ttl)
 				if config.AppConfig != nil && config.AppConfig.AsyncLogEnabled {
 					fmt.Printf("[主程序] 缓存更新完成: %s | 结果数: %d", 
